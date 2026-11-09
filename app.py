@@ -10,6 +10,7 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import streamlit as st
+import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -254,6 +255,125 @@ def render_order_plan(plan, capital):
                "目标价未必会到，止损价必须执行。")
 
 
+# ========== 操作单历史存档 ==========
+
+HISTORY_DIR = PROJECT_ROOT / "output" / "orders"
+HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_order_plan(plan_df, pool_label, capital):
+    """把今日操作单追加到历史存档（CSV 按日期分行存储）"""
+    if plan_df is None or plan_df.empty:
+        return
+    today = datetime.date.today().isoformat()
+    out = plan_df.copy()
+    out.insert(0, "日期", today)
+    out.insert(1, "选股范围", pool_label)
+    out.insert(2, "本金", capital)
+
+    hist_file = HISTORY_DIR / "orders_history.csv"
+    if hist_file.exists():
+        existing = pd.read_csv(hist_file)
+        # 同一天同一范围已存过 → 覆盖更新
+        mask = (existing["日期"] == today) & (existing["选股范围"] == pool_label)
+        if mask.any():
+            existing = existing[~mask]
+        existing = pd.concat([existing, out], ignore_index=True)
+    else:
+        existing = out
+    existing.to_csv(hist_file, index=False, encoding="utf-8-sig")
+
+
+def load_order_history():
+    """读历史存档，按日期倒序返回 DataFrame"""
+    hist_file = HISTORY_DIR / "orders_history.csv"
+    if not hist_file.exists():
+        return None
+    df = pd.read_csv(hist_file)
+    df = df.sort_values("日期", ascending=False).reset_index(drop=True)
+    return df
+
+
+def render_order_history():
+    """渲染历史操作单对比视图"""
+    df = load_order_history()
+    if df is None or df.empty:
+        st.info("📚 还没有历史操作单。点左侧「📋 生成今日操作单」会自动存档。")
+        return
+
+    dates = sorted(df["日期"].unique(), reverse=True)
+    st.success(f"📚 已有 {len(dates)} 天 / {len(df)} 条历史记录")
+
+    col1, col2 = st.columns(2)
+    d1 = col1.selectbox("对比起始日期", dates, index=0, key="hist_d1")
+    d2 = col2.selectbox("对比截止日期", dates,
+                        index=min(1, len(dates) - 1), key="hist_d2")
+
+    pool_label = st.selectbox(
+        "选股范围（留空=全部）",
+        ["全部"] + sorted(df["选股范围"].unique().tolist()),
+        key="hist_pool")
+
+    mask1 = df["日期"] == d1
+    mask2 = df["日期"] == d2
+    if pool_label != "全部":
+        mask1 &= df["选股范围"] == pool_label
+        mask2 &= df["选股范围"] == pool_label
+
+    df1 = df[mask1].copy()
+    df2 = df[mask2].copy()
+
+    sub1, sub2 = st.columns(2)
+    with sub1:
+        st.markdown(f"### 📅 {d1} （{pool_label}）")
+        if df1.empty:
+            st.caption("该日期无记录")
+        else:
+            buy1 = df1[df1["可买"] == True] if "可买" in df1.columns else df1
+            st.dataframe(
+                buy1[["代码", "名称", "现价", "买入价", "止损价", "目标价",
+                      "盈亏比", "股数"]].reset_index(drop=True),
+                use_container_width=True, hide_index=True, height=250)
+            st.caption(f"可买 {len(buy1)} 只 / 共 {len(df1)} 只")
+
+    with sub2:
+        st.markdown(f"### 📅 {d2} （{pool_label}）")
+        if df2.empty:
+            st.caption("该日期无记录")
+        else:
+            buy2 = df2[df2["可买"] == True] if "可买" in df2.columns else df2
+            st.dataframe(
+                buy2[["代码", "名称", "现价", "买入价", "止损价", "目标价",
+                      "盈亏比", "股数"]].reset_index(drop=True),
+                use_container_width=True, hide_index=True, height=250)
+            st.caption(f"可买 {len(buy2)} 只 / 共 {len(df2)} 只")
+
+    # 汇总对比
+    st.subheader("📊 变化对比")
+    if not df1.empty and not df2.empty:
+        codes1 = set(df1["代码"].tolist())
+        codes2 = set(df2["代码"].tolist())
+        only_d1 = codes1 - codes2  # 只有 d1 推荐、d2 不再推荐
+        only_d2 = codes2 - codes1  # 只有 d2 推荐、d1 当时没推荐
+        common = codes1 & codes2   # 两天都推荐的
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric(f"{d1} 独有（今天被移除）", len(only_d1))
+        c2.metric(f"{d2} 新增（今天新进来）", len(only_d2))
+        c3.metric("两天都推荐（持续看好）", len(common))
+
+        if only_d1:
+            with st.expander(f"🔴 {d1} 独有 → 现在不再推荐（{len(only_d1)} 只）"):
+                st.dataframe(df1[df1["代码"].isin(only_d1)][
+                    ["代码", "名称", "现价", "买入价", "止损价"]],
+                    use_container_width=True, hide_index=True)
+        if only_d2:
+            with st.expander(f"🟢 {d2} 新增 → 今天第一次出现（{len(only_d2)} 只）"):
+                st.dataframe(df2[df2["代码"].isin(only_d2)][
+                    ["代码", "名称", "现价", "买入价", "止损价"]],
+                    use_container_width=True, hide_index=True)
+
+
 def render_review(rdf):
     """渲染持仓体检结论"""
     if rdf.empty:
@@ -489,6 +609,11 @@ with st.sidebar:
     broker_btn = st.button("📝 生成券商条件单清单", type="secondary",
                            use_container_width=True)
 
+    st.divider()
+    st.subheader("📚 历史操作单")
+    st.caption("自动存档，随时回看 / 对比历史推荐")
+    show_history = st.checkbox("查看历史 & 对比", value=False)
+
 
 # ========== 主区域 ==========
 st.title(f"{PAGE_ICON} {PAGE_TITLE}")
@@ -557,7 +682,10 @@ if order_btn:
     if cached["message"]:
         st.warning(f"⚠️ {cached['message']}")
     else:
-        render_order_plan(order_plan(cached["result"], scan_capital), scan_capital)
+        plan = order_plan(cached["result"], scan_capital)
+        save_order_plan(plan, scan_pool_label, scan_capital)
+        st.caption(f"💾 已自动存档至 output/orders/orders_history.csv")
+        render_order_plan(plan, scan_capital)
 
 if paper_btn:
     st.subheader("🤖 模拟盘自动交易")
@@ -678,6 +806,9 @@ if broker_btn:
 
 elif order_btn or paper_btn or review_btn:
     pass  # 操作单 / 模拟账户 / 持仓体检已在上面渲染，这里不重复展示
+elif show_history:
+    st.subheader("📚 历史操作单 & 日期对比")
+    render_order_history()
 elif show_paper:
     st.subheader("🤖 当前模拟账户")
     render_paper_account(read_state(),
