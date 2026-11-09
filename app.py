@@ -258,13 +258,18 @@ def render_order_plan(plan, capital):
 # ========== 操作单历史存档 ==========
 
 HISTORY_DIR = PROJECT_ROOT / "output" / "orders"
-HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    _HISTORY_OK = True
+except PermissionError:
+    _HISTORY_OK = False  # 杀毒软件拦截时降级，不让页面崩
 
 
 def save_order_plan(plan_df, pool_label, capital):
     """把今日操作单追加到历史存档（CSV 按日期分行存储）"""
-    if plan_df is None or plan_df.empty:
-        return
+    global _HISTORY_OK
+    if not _HISTORY_OK or plan_df is None or plan_df.empty:
+        return False
     today = datetime.date.today().isoformat()
     out = plan_df.copy()
     out.insert(0, "日期", today)
@@ -272,16 +277,20 @@ def save_order_plan(plan_df, pool_label, capital):
     out.insert(2, "本金", capital)
 
     hist_file = HISTORY_DIR / "orders_history.csv"
-    if hist_file.exists():
-        existing = pd.read_csv(hist_file)
-        # 同一天同一范围已存过 → 覆盖更新
-        mask = (existing["日期"] == today) & (existing["选股范围"] == pool_label)
-        if mask.any():
-            existing = existing[~mask]
-        existing = pd.concat([existing, out], ignore_index=True)
-    else:
-        existing = out
-    existing.to_csv(hist_file, index=False, encoding="utf-8-sig")
+    try:
+        if hist_file.exists():
+            existing = pd.read_csv(hist_file)
+            mask = (existing["日期"] == today) & (existing["选股范围"] == pool_label)
+            if mask.any():
+                existing = existing[~mask]
+            existing = pd.concat([existing, out], ignore_index=True)
+        else:
+            existing = out
+        existing.to_csv(hist_file, index=False, encoding="utf-8-sig")
+        return True
+    except (PermissionError, OSError):
+        _HISTORY_OK = False
+        return False
 
 
 def load_order_history():
