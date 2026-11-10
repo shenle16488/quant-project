@@ -25,8 +25,16 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _sina_symbol(symbol):
-    """纯数字代码 → 新浪格式 (sh600519 / sz000858)"""
+    """纯数字代码 → 新浪格式 (sh600519 / sz000858)
+    
+    兼容输入格式：
+      - sh600519 / sz000858（已带前缀） → 直接返回
+      - 600519 / 000858（纯数字）     → 自动加前缀
+    """
     s = str(symbol).split(".")[0]
+    s_lower = s.lower()
+    if s_lower.startswith("sh") or s_lower.startswith("sz"):
+        return s_lower  # 已经带前缀了，直接用
     prefix = "sh" if s.startswith(("6", "9")) else "sz"
     return f"{prefix}{s}"
 

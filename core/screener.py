@@ -183,6 +183,38 @@ def scan_one(code, name, start, end, capital=CAPITAL):
 
     vol, dist_ma, ret20, mdd = risk_profile(close)
 
+    # ========== 新增指标：RSI / ATR / 量比 ==========
+    # RSI(14)：排除超买(>70) 和 超卖(<30，可能继续跌)
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    rsi14 = (100 - 100 / (1 + rs)).iloc[-1]
+
+    # ATR(14)%：排除波动太大的妖股（止损容易被来回打）
+    tr = pd.DataFrame({
+        "hl": df["High"] - df["Low"],
+        "hc": (df["High"] - close.shift(1)).abs(),
+        "lc": (df["Low"] - close.shift(1)).abs(),
+    }).max(axis=1)
+    atr14_pct = (tr.rolling(14).mean() / close).iloc[-1]
+
+    # 量比：今日量 / 60日均量，排除无量空涨或放量暴跌
+    vol_col = df["Volume"] if "Volume" in df.columns else (df["vol"] if "vol" in df.columns else None)
+    if vol_col is not None:
+        vol_ratio = float(vol_col.iloc[-1] / vol_col.rolling(60).mean().iloc[-1])
+    else:
+        vol_ratio = 1.0
+
+    # ========== 矛盾信号排除（暂时关闭，先看过滤链路） ==========
+    # has_bollinger = any("布林" in n for n, _ in hits)
+    # if has_bollinger and len(hits) >= 2:
+    #     ma50 = close.rolling(50).mean().iloc[-1]
+    #     ma200 = close.rolling(200).mean().iloc[-1]
+    #     price = float(close.iloc[-1])
+    #     if ma50 < ma200 and price < ma200 * 0.90:
+    #         return None
+
     open_ = df["Open"]
     prev_close = float(close.iloc[-2])
     today_open = float(open_.iloc[-1])
@@ -202,6 +234,9 @@ def scan_one(code, name, start, end, capital=CAPITAL):
         "年化波动": vol,
         "距年线": dist_ma,
         "近1年最大回撤": mdd,
+        "RSI14": round(float(rsi14), 1),
+        "ATR%": round(float(atr14_pct * 100), 2),
+        "量比": round(float(vol_ratio), 2),
     }
     row.update(trade_plan(close, capital))
     return row
@@ -259,11 +294,18 @@ def screen(index_code="000300", top_n=None, min_hits=MIN_STRATEGY_HITS,
                 "failed": failed, "capital": capital,
                 "message": f"没有股票达到 {min_hits} 个策略共振"}
 
+    # 健康度门槛 + 新增指标过滤
+    # RSI 25-70：排除超买(>70容易回落) 和 极端超卖(<25)
+    # ATR% < 5%：排除极端波动，否则止损止盈容易被来回打
+    # 量比 ≥ 0.5：排除地量股，至少有一半正常量
     healthy = hits[
         (hits["年化波动"] <= MAX_VOL)
         & (hits["距年线"] >= MIN_DIST_MA)
         & (hits["近1年最大回撤"] >= MAX_MDD)
         & (hits["20日涨幅"] >= MIN_RET20)
+        & (hits["RSI14"] >= 25) & (hits["RSI14"] <= 70)
+        & (hits["ATR%"] <= 5.0)
+        & (hits["量比"] >= 0.5)
     ].copy()
 
     if healthy.empty:
