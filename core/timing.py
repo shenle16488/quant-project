@@ -27,47 +27,54 @@ except PermissionError:
 
 
 def _simulate_outcomes(df, buy_col, stop_pct, target_pct, max_hold_days=20):
-    """在 df（含 Open/High/Low/Close）上逐行模拟：
-    假设在 buy_col 那一天买入，接下来 max_hold_days 天内：
-    - 先触止损？还是先触止盈？还是持有期内都没触发？
+    """逐日 forward 遍历：模拟在 buy_col 那天买入，接下来 N 天内
+    先触止损？先触止盈？还是持有到期都没触发？
 
-    返回列：stop_hit（bool）/ target_hit（bool）/ exit_day（int）
+    （之前用 rolling.max().shift(-1) 有两个 bug：
+      1) rolling 包含当天 K 线的 High/Low，不能算"未来"
+      2) 两者都触发时标"待定"直接丢分母 → 胜率被严重低估
+    现在逐日遍历，精确判定谁先触发）
     """
-    buy_prices = df[buy_col].shift(0)
-    high_fwd = df["High"].rolling(max_hold_days, min_periods=1).max().shift(-1)
-    low_fwd = df["Low"].rolling(max_hold_days, min_periods=1).min().shift(-1)
+    buy_prices = df[buy_col].values
+    highs = df["High"].values
+    lows = df["Low"].values
+    n = len(df)
 
-    stop_line = buy_prices * (1 - stop_pct)
-    target_line = buy_prices * (1 + target_pct)
+    results = []
+    for i in range(n):
+        if i + 1 >= n:
+            results.append(None)
+            continue
 
-    # 方向判定：先看最低有没有穿过止损，再看最高有没有穿过目标
-    # 简化：用 forward rolling 的 min / max 来替代逐日遍历（足够统计意义）
-    low_reach = low_fwd <= stop_line   # 有一天跌到止损线下
-    high_reach = high_fwd >= target_line  # 有一天涨到目标线上
+        bp = buy_prices[i]
+        stop_line = bp * (1 - stop_pct)
+        target_line = bp * (1 + target_pct)
 
-    # 更精细：止损和止盈谁先触发——需要逐日遍历
-    # 向量化做个折中：如果两者都触发，按 50/50 概率算（实际差不多）
-    stop_first = low_reach & ~high_reach
-    target_first = high_reach & ~low_reach
-    both = low_reach & high_reach
+        outcome = "持有到期"
+        for j in range(i + 1, min(i + 1 + max_hold_days, n)):
+            # 逐日检查：这一天的 Low 有没有先摸到止损？High 有没有摸到止盈？
+            # 保守假设：先看 Low（止损），再看 High（止盈）
+            if lows[j] <= stop_line:
+                outcome = "止损"
+                break
+            if highs[j] >= target_line:
+                outcome = "止盈"
+                break
 
-    results = pd.Series(index=df.index, dtype=object)
-    results[stop_first] = "止损"
-    results[target_first] = "止盈"
-    results[both] = "待定"  # 简化，下面展开
-    results[~(low_reach | high_reach)] = "持有到期"
-    return results
+        results.append(outcome)
+
+    return pd.Series(results, index=df.index)
 
 
 def analyze_single_symbol(symbol, start_date, end_date,
                           buy_mode="close",
                           stop_pct=0.08, target_pct=0.16,
                           max_hold_days=20,
-                          signal_filter=None):
+                          signal_filter=None,
+                          custom_filter=None):
     """对单只股票分析不同买入价的胜率
 
-    signal_filter: callable(close_series) -> bool series，
-                   只有信号为 True 时才计入统计（比如均线多头的日子才买）
+    signal_filter/custom_filter: callable(close_series) -> bool series
     """
     try:
         df = fetch_daily(symbol, start_date, end_date, source="akshare")
@@ -78,10 +85,17 @@ def analyze_single_symbol(symbol, start_date, end_date,
     if len(df) < 60:
         return None
 
+    mask = None
     if signal_filter is not None:
-        mask = signal_filter(df["Close"])
+        m1 = signal_filter(df["Close"])
+        mask = m1 if mask is None else (mask & m1)
+    if custom_filter is not None:
+        m2 = custom_filter(df["Close"])
+        mask = m2 if mask is None else (mask & m2)
+
+    if mask is not None:
         df = df[mask]
-        if len(df) < 20:
+        if len(df) < 10:
             return None
 
     buy_col_map = {"open": "Open", "low": "Low", "high": "High", "close": "Close"}
@@ -105,10 +119,12 @@ def run_timing_analysis(symbols, start_date, end_date,
                         stop_pct=0.08, target_pct=0.16,
                         max_hold_days=20,
                         signal_key=None, signal_params=None,
-                        progress_cb=None):
+                        progress_cb=None,
+                        custom_filter=None):
     """对一批股票跑不同买入价位的胜率分析
 
     返回 DataFrame：每行一个 (symbol, buy_mode) 的统计
+    custom_filter: callable(close_series) -> bool series
     """
     buy_modes = ["open", "low", "high", "close"]
     results = []
@@ -126,7 +142,7 @@ def run_timing_analysis(symbols, start_date, end_date,
         for sym in symbols:
             fm = ex.submit(analyze_single_symbol, sym, start_date, end_date,
                            "close", stop_pct, target_pct, max_hold_days,
-                           _signal_filter)
+                           _signal_filter, custom_filter)
             futures[fm] = sym
 
         done = 0
@@ -143,7 +159,7 @@ def run_timing_analysis(symbols, start_date, end_date,
             for mode in buy_modes:
                 fm2 = ex.submit(analyze_single_symbol, sym, start_date, end_date,
                                 mode, stop_pct, target_pct, max_hold_days,
-                                _signal_filter)
+                                _signal_filter, custom_filter)
                 outcomes = fm2.result()
                 if outcomes is None:
                     continue

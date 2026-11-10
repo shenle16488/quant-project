@@ -44,6 +44,41 @@ MODE_LABEL_CN = {
 }
 
 
+def _filter_multisignal(close):
+    """多策略共振过滤：至少 2 个策略同时看多"""
+    from core.strategies import get_strategy
+    from config import STRATEGY_PARAMS
+    hits = pd.Series(0, index=close.index)
+    for key, params in STRATEGY_PARAMS.items():
+        p = dict(params)
+        if "exit" in p:
+            p["exit_"] = p.pop("exit")
+        strat = get_strategy(key)
+        sig = strat.generate_signal(close, **p)
+        hits += (sig == 1).astype(int)
+    return hits >= 2
+
+
+def _filter_bull_trend(close):
+    """大盘上涨趋势过滤：指数在 200 日线上方（回测用个股自身 200 日线）"""
+    ma200 = close.rolling(200).mean()
+    return close > ma200
+
+
+def _filter_low_vol(close):
+    """低波动过滤：近 60 日年化波动 ≤ 40%"""
+    ret = close.pct_change().dropna()
+    vol60 = ret.tail(60).std() * np.sqrt(252)
+    return pd.Series(vol60 <= 0.40, index=close.index)
+
+
+def _composite_filter(close):
+    """组合过滤：共振 ≥ 2 + 在 200 日线上"""
+    sig = _filter_multisignal(close)
+    trend = _filter_bull_trend(close)
+    return sig & trend
+
+
 def _resolve_best_timing(pool_code, stop_pct=0.08, target_pct=0.16):
     """跑胜率分析，返回整体最佳买入价位 + 对应时段"""
     from core.screener import get_universe
@@ -58,11 +93,15 @@ def _resolve_best_timing(pool_code, stop_pct=0.08, target_pct=0.16):
     # 只扫 50 只就够了（整体统计不需要全量）
     codes = universe["code"].tolist()[:50]
 
+    # 关键改进：只在"≥2 个策略共振 + 200日线上方"的日子统计
+    # 这才是你实盘真正买入的场景，胜率数字才有参考意义
     results = run_timing_analysis(
         codes, start.strftime("%Y%m%d"), end.strftime("%Y%m%d"),
         stop_pct=stop_pct, target_pct=target_pct,
         max_hold_days=20,
         signal_key=None, signal_params=None,
+        progress_cb=None,
+        custom_filter=_composite_filter,
     )
     if results is None:
         return "close", ("09:45", "10:30"), 0.0
