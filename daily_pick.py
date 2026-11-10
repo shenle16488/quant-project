@@ -157,7 +157,10 @@ def main():
         return
 
     if res["message"] or not res["result"].empty is False:
-        print(f"⚠️ {res['message'] or '无候选股'}")
+        msg = res["message"] or "无候选股"
+        print(f"⚠️ {msg}")
+        if "禁止买入" in msg or "空仓" in msg:
+            print("🛡️ 大盘环境不佳，今天不操作，等下一个交易日")
         return
 
     # 3. 生成操作单
@@ -198,6 +201,7 @@ def main():
         lots = int(row["股数"])
         ratio = row["盈亏比"]
         resonance = int(row["共振数"])
+        confidence = row.get("置信分", "—")
 
         rt_price = rt_map.get(code)
         rt_note = ""
@@ -211,7 +215,7 @@ def main():
         print(f"   ⏰ {best_window[0]}~{best_window[1]}  "
               f"买≤{buy_price:.2f}  止损{stop:.2f}  目标{target:.2f}  "
               f"买{lots}股  盈亏比{ratio:.1f}:1")
-        print(f"   理由: {resonance}个策略共振{rt_note}")
+        print(f"   理由: {resonance}个策略共振 置信度{confidence}{rt_note}")
         print()
 
     total_amount = buy["金额"].sum()

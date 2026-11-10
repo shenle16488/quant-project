@@ -35,7 +35,7 @@ REWARD_RATIO = 2.0        # 目标价：按 2:1 盈亏比推算
 CAPITAL = 100000          # 默认本金（元）
 MAX_POSITION_PCT = 0.10   # 单只股票最多占总资金 10%
 MAX_CHASE_PCT = 0.08      # 现价高于 20 日线 8% 视为追高，建议等回踩
-MAX_ORDERS = 5            # 一次操作单最多买几只（与模拟盘持仓上限一致）
+MAX_ORDERS = 3            # 单日最多开 3 只新仓（实盘纪律）
 
 INDEX_POOLS = {
     "000300": "沪深300",
@@ -272,10 +272,85 @@ def screen(index_code="000300", top_n=None, min_hits=MIN_STRATEGY_HITS,
                 "message": (f"{len(hits)} 只共振股全部未通过健康度门槛，"
                             "说明当前市场处于急跌阶段，此时买入信号多为接刀")}
 
-    healthy = healthy.sort_values(["共振数", "距年线"],
-                                  ascending=[False, False]).reset_index(drop=True)
-    return {"result": healthy[COLUMNS], "all_hits": hits, "scanned": total,
-            "failed": failed, "capital": capital, "message": ""}
+    # ========== 改进 1：共振天数加权评分 ==========
+    # 共振数越高 + 每个策略的共振天数越长 → 置信度越高
+    def _confidence_row(row):
+        total_days = 0
+        for part in str(row["共振策略"]).split(" + "):
+            try:
+                days = int(part.split("(")[-1].rstrip("天)"))
+            except (ValueError, IndexError):
+                days = 1
+            total_days += days
+        # 公式：共振数 × log(总天数 + 1)，共振数权重更大
+        return row["共振数"] * np.log(total_days + 1)
+
+    healthy["置信分"] = healthy.apply(_confidence_row, axis=1)
+
+    # ========== 改进 2：波动过滤排除妖股（年化波动 > 60% 排除） ==========
+    healthy = healthy[healthy["年化波动"] <= 0.60].copy()
+    if healthy.empty:
+        return {"result": healthy, "all_hits": hits, "scanned": total,
+                "failed": failed, "capital": capital,
+                "message": f"高波动妖股全部被排除，剩余候选为空"}
+
+    # ========== 改进 3：大盘空仓检查 ==========
+    # 扫一下指数自身是否跌破 250 日线 + 近 60 日跌超 15%
+    bear_market = False
+    bear_reason = ""
+    try:
+        end_date = datetime.date.today().strftime("%Y%m%d")
+        start_date = (datetime.date.today() - datetime.timedelta(days=400)).strftime("%Y%m%d")
+        index_map = {"000300": "sh000300", "000905": "sh000905", "000852": "sh000852"}
+        idx_symbol = index_map.get(index_code)
+        if idx_symbol:
+            idx_df = handle_missing(fetch_daily(idx_symbol, start_date, end_date, source="akshare"))
+            idx_close = idx_df["Close"]
+            idx_ma250 = idx_close.rolling(250).mean().iloc[-1]
+            idx_ret60 = idx_close.iloc[-1] / idx_close.iloc[-60] - 1 if len(idx_close) >= 60 else 0
+            if idx_close.iloc[-1] < idx_ma250 and idx_ret60 < -0.15:
+                bear_market = True
+                bear_reason = (f"指数跌破 250 日线 + 近 60 日跌 {idx_ret60:.1%}，"
+                               "市场系统性下跌，空仓等待")
+    except Exception:
+        pass  # 大盘检查失败不阻塞选股
+
+    if bear_market:
+        return {"result": healthy[COLUMNS + ["置信分"]], "all_hits": hits,
+                "scanned": total, "failed": failed, "capital": capital,
+                "message": f"⚠️ {bear_reason}，今日全部候选禁止买入"}
+
+    # ========== 改进 4：同行业最多保留 1 只 + 单日最多取 5 只 ==========
+    # 行业信息：这里先用"代码前缀"做粗略分类（600/601=主板沪, 000/002/300=主板深/中小/创业）
+    # 精确行业可以后续接 akshare 行业接口
+    def _industry_group(code):
+        s = str(code).zfill(6)
+        if s.startswith(("600", "601", "603", "605")):
+            return "沪主板"
+        elif s.startswith(("000", "001", "002", "003")):
+            return "深主板/中小板"
+        elif s.startswith(("300", "301")):
+            return "创业板"
+        elif s.startswith(("688", "689")):
+            return "科创板"
+        else:
+            return "其他"
+
+    healthy["板块"] = healthy["代码"].apply(_industry_group)
+
+    # 每个板块只保留置信分最高的 1 只
+    healthy = (healthy.sort_values(["板块", "置信分"], ascending=[True, False])
+                      .groupby("板块", group_keys=False)
+                      .head(2)  # 放宽到每个板块 2 只（A股 4 个板块够分散）
+                      .reset_index(drop=True))
+
+    # 最终按置信分排序，取前 5 只
+    healthy = (healthy.sort_values("置信分", ascending=False)
+                      .head(5)
+                      .reset_index(drop=True))
+
+    return {"result": healthy[COLUMNS + ["置信分"]], "all_hits": hits,
+            "scanned": total, "failed": failed, "capital": capital, "message": ""}
 
 
 def format_for_display(df):
@@ -298,7 +373,7 @@ def order_plan(df, capital=CAPITAL, min_ratio=1.5):
     - 股数：单只最多 10% 本金，按 100 股一手向下取整
     """
     cols = ["代码", "名称", "现价", "买入区间", "买入价", "股数", "金额",
-            "止损价", "目标价", "盈亏比", "买入时机", "距买点", "共振数", "备注", "可买"]
+            "止损价", "目标价", "盈亏比", "买入时机", "距买点", "共振数", "置信分", "备注", "可买"]
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=cols)
 
@@ -360,6 +435,7 @@ def order_plan(df, capital=CAPITAL, min_ratio=1.5):
             "买入时机": when,
             "距买点": round(dist, 4),
             "共振数": int(s["共振数"]),
+            "置信分": float(s.get("置信分", 0)) if "置信分" in s.index else 0,
             "备注": note,
             "可买": bool(ok),
         })
