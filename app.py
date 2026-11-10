@@ -796,6 +796,48 @@ with st.sidebar:
 # ========== 主区域 ==========
 st.title(f"{PAGE_ICON} {PAGE_TITLE}")
 
+# ========== 每日指令卡片（自动读取 daily_pick 输出） ==========
+DAILY_PICK_FILE = PROJECT_ROOT / "output" / "daily_pick_result.txt"
+
+def render_daily_pick_card():
+    if not DAILY_PICK_FILE.exists():
+        return
+    try:
+        text = DAILY_PICK_FILE.read_text(encoding="utf-8")
+    except Exception:
+        return
+    if not text.strip():
+        return
+
+    # 解析关键行
+    header = ""
+    body_lines = []
+    for line in text.split("\n"):
+        if line.startswith("📅"):
+            header = line
+        elif line.startswith("1.") or line.startswith("2.") or line.startswith("3.") \
+                or line.startswith("4.") or line.startswith("5.") or line.startswith("6.") \
+                or line.startswith("7.") or line.startswith("8."):
+            body_lines.append(line.strip())
+        elif line.strip().startswith("⏰"):
+            body_lines.append("  " + line.strip())
+
+    mtime = datetime.datetime.fromtimestamp(DAILY_PICK_FILE.stat().st_mtime)
+
+    with st.container(border=True):
+        if header:
+            st.markdown(f"## 🎯 {header}")
+        for bl in body_lines:
+            st.markdown(f"`{bl}`")
+        st.caption(f"📤 止损市价委托 / 止盈限价委托 / 有效期 90 天 ｜ "
+                   f"⚠️ 历史胜率不代表未来，单只不超 10% 仓位 ｜ "
+                   f"更新于 {mtime:%H:%M:%S}")
+        if st.button("🔄 重新生成今日指令", key="regen_daily"):
+            st.session_state["regen_pick"] = True
+
+render_daily_pick_card()
+st.divider()
+
 pool_code = {v: k for k, v in INDEX_POOLS.items()}[scan_pool_label]
 
 if scan_btn:
