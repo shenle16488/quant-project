@@ -19,7 +19,11 @@ from core.strategies import get_strategy
 
 
 TIMING_CACHE = OUTPUT_DIR / "timing"
-TIMING_CACHE.mkdir(parents=True, exist_ok=True)
+try:
+    TIMING_CACHE.mkdir(parents=True, exist_ok=True)
+    _TIMING_OK = True
+except PermissionError:
+    _TIMING_OK = False
 
 
 def _simulate_outcomes(df, buy_col, stop_pct, target_pct, max_hold_days=20):
