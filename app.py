@@ -29,6 +29,7 @@ from core.paper_trader import (
     run_once as paper_run, read_state, positions_frame, trades_frame,
 )
 from core.holdings_review import review_all
+from core.timing import run_timing_analysis, aggregate_timing, fetch_realtime_quotes
 from backtest.vectorized import backtest_from_signal
 from backtest.metrics import format_metrics
 
@@ -383,6 +384,157 @@ def render_order_history():
                     use_container_width=True, hide_index=True)
 
 
+def render_timing_analysis(timing_stop, timing_target, timing_days, timing_filter,
+                           scan_pool_label, pool_code):
+    """买入时机胜率分析"""
+    from core.screener import get_universe
+
+    st.subheader("⏰ 买入时机胜率分析")
+    st.caption(f"参数：止损 {timing_stop:.0%} / 止盈 {timing_target:.0%} / "
+               f"最多持有 {timing_days} 天 / 范围 {scan_pool_label}")
+
+    with st.spinner(f"正在拉 {scan_pool_label} 成分股历史数据，约 2~5 分钟..."):
+        try:
+            universe = get_universe(pool_code)
+        except Exception as e:
+            st.error(f"取成分股失败：{e}")
+            return
+
+    signal_map = {"不限": None, "双均线多头": "dual_ma", "海龟多头": "turtle"}
+    sig_key = signal_map.get(timing_filter)
+    sig_params = {"fast": 50, "slow": 200} if sig_key == "dual_ma" else \
+                 {"entry": 20, "exit_": 10} if sig_key == "turtle" else None
+
+    # 用缓存数据覆盖区间
+    end = datetime.date.today()
+    start = end - datetime.timedelta(days=365 * 3)
+
+    prog = st.progress(0.0)
+    status = st.empty()
+
+    def _cb(done, total):
+        prog.progress(min(done / max(total, 1), 1.0))
+        status.caption(f"已分析 {done}/{total} 只")
+
+    with st.spinner("逐股回测四种买入价位胜率..."):
+        results = run_timing_analysis(
+            universe["code"].tolist(),
+            start.strftime("%Y%m%d"), end.strftime("%Y%m%d"),
+            stop_pct=timing_stop, target_pct=timing_target,
+            max_hold_days=timing_days,
+            signal_key=sig_key, signal_params=sig_params,
+            progress_cb=_cb,
+        )
+    prog.empty(); status.empty()
+
+    if results is None or results.empty:
+        st.warning("⚠️ 没有足够的样本数据，可能是成分股都没有符合条件的历史交易日")
+        return
+
+    # 整体聚合
+    agg = aggregate_timing(results)
+    st.success(f"✅ 分析完成：{len(results)} 组 (股票 × 买入方式) 数据 / "
+               f"总样本 {results['样本数'].sum():,} 个买入机会")
+
+    st.subheader("📊 各买入时机汇总（按加权胜率排序）")
+    show = agg.copy()
+    for c in ["平均胜率", "加权胜率", "平均止损率"]:
+        show[c] = (show[c] * 100).round(1).astype(str) + "%"
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
+    # 胜率柱状图
+    fig, ax = plt.subplots(figsize=(10, 4))
+    modes = agg["买入方式"].tolist()
+    win_rates = agg["加权胜率"].tolist()
+    colors = ["#14805e" if w >= 0.55 else "#c0563f" if w < 0.45 else "#f0a020"
+              for w in win_rates]
+    bars = ax.bar(modes, [w * 100 for w in win_rates], color=colors, edgecolor="white")
+    for bar, w in zip(bars, win_rates):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                f"{w * 100:.1f}%", ha="center", va="bottom", fontsize=11, fontweight="bold")
+    ax.set_ylabel("加权胜率 %")
+    ax.set_title(f"不同买入价位的胜率对比（止损 {timing_stop:.0%} / 止盈 {timing_target:.0%}）")
+    ax.set_ylim(0, max(win_rates) * 100 + 10)
+    ax.grid(axis="y", alpha=0.3)
+    st.pyplot(fig, clear_figure=True)
+
+    # 逐股明细
+    with st.expander("📋 逐股胜率明细", expanded=False):
+        detail = results.copy()
+        for c in ["胜率", "止损率", "持有到期率"]:
+            detail[c] = (detail[c] * 100).round(1).astype(str) + "%"
+        st.dataframe(
+            detail[["代码", "买入方式", "样本数", "胜率", "止损率", "持有到期率"]],
+            use_container_width=True, hide_index=True, height=400)
+
+    # 解读建议
+    best = agg.iloc[0]
+    worst = agg.iloc[-1]
+    st.info(
+        f"**结论**：在{scan_pool_label}里，"
+        f"**{best['买入方式']}** 加权胜率最高（{best['加权胜率']:.1%}），"
+        f"而 **{worst['买入方式']}** 最差（{worst['加权胜率']:.1%}）。"
+        f"\n\n**实操建议**：盘中尽量避免追高在日内高点买入，"
+        f"优先在日内低位或收盘附近挂限价单。"
+    )
+
+
+def render_realtime_snapshot(plan_df, pool_label):
+    """拉实时行情，对比操作单里的买入价"""
+    if plan_df is None or plan_df.empty:
+        st.info("先点「📋 生成今日操作单」再看实时行情对比")
+        return
+
+    codes = plan_df["代码"].tolist()
+    st.subheader(f"📡 盘中实时行情快照 · {pool_label}")
+    st.caption(f"正在拉 {len(codes)} 只候选股的实时行情...（akshare 东方财富接口）")
+
+    with st.spinner("请求中..."):
+        rt = fetch_realtime_quotes(codes)
+
+    if rt is None or rt.empty:
+        st.warning("⚠️ 实时行情接口请求失败，可能是限流器或非交易时段。15:00~9:15 不开盘。")
+        return
+
+    # 合并操作单的目标价/止损价
+    merged = plan_df.merge(rt, on="代码", how="left", suffixes=("", "_rt"))
+
+    def _pos(row):
+        """现价相对买入区间的位置"""
+        try:
+            lo, hi = [float(v) for v in str(row.get("买入区间", "0~0")).split("~")]
+            cur = float(row.get("现价_rt", 0))
+            if cur == 0 or (lo == 0 and hi == 0):
+                return "—"
+            if lo <= cur <= hi:
+                return "🟢 买点内"
+            elif cur < lo:
+                return f"🔴 低于买点 {(lo / cur - 1) * 100:.1f}%"
+            else:
+                return f"🟡 高于买点 {(cur / hi - 1) * 100:.1f}%"
+        except Exception:
+            return "—"
+
+    merged["位置判断"] = merged.apply(_pos, axis=1)
+    merged["涨跌幅_rt"] = merged["涨跌幅"].astype(float).round(2)
+
+    show_cols = ["代码", "名称_rt", "现价_rt", "涨跌幅_rt", "最高", "最低",
+                 "买入区间", "买入价", "止损价", "目标价", "位置判断"]
+    show = merged[[c for c in show_cols if c in merged.columns]].copy()
+    show = show.rename(columns={"名称_rt": "名称", "现价_rt": "现价", "涨跌幅_rt": "涨跌%"})
+
+    st.dataframe(show, use_container_width=True, hide_index=True, height=400)
+
+    buy_count = (show["位置判断"].str.startswith("🟢")).sum()
+    wait_count = (show["位置判断"].str.startswith("🔴") | show["位置判断"].str.startswith("🟡")).sum()
+    c1, c2 = st.columns(2)
+    c1.metric("🟢 正在买点内（可挂单）", int(buy_count))
+    c2.metric("⏳ 等价格到位", int(wait_count))
+
+    st.caption(f"快照时间：{datetime.datetime.now():%Y-%m-%d %H:%M:%S} | "
+               f"数据来源：东方财富实时行情")
+
+
 def render_review(rdf):
     """渲染持仓体检结论"""
     if rdf.empty:
@@ -623,6 +775,23 @@ with st.sidebar:
     st.caption("自动存档，随时回看 / 对比历史推荐")
     show_history = st.checkbox("查看历史 & 对比", value=False)
 
+    st.divider()
+    st.subheader("⏰ 买入时机胜率")
+    st.caption("回测：开盘 / 最低 / 最高 / 收盘买入的胜率差")
+    timing_stop = st.slider("止损%", 0.02, 0.15, 0.08, 0.01, key="t_stop")
+    timing_target = st.slider("止盈%", 0.04, 0.30, 0.16, 0.02, key="t_target")
+    timing_days = st.slider("最多持有天数", 5, 60, 20, 5, key="t_days")
+    timing_filter = st.selectbox("仅统计信号日",
+                                 ["不限", "双均线多头", "海龟多头"],
+                                 key="t_filter")
+    timing_btn = st.button("⏰ 跑买入时机胜率分析", type="secondary",
+                           use_container_width=True)
+
+    st.subheader("📡 盘中实时")
+    st.caption("盘中不同时间点拉实时行情，看候选股位置")
+    realtime_btn = st.button("📡 拉实时行情快照", type="secondary",
+                             use_container_width=True)
+
 
 # ========== 主区域 ==========
 st.title(f"{PAGE_ICON} {PAGE_TITLE}")
@@ -693,6 +862,7 @@ if order_btn:
     else:
         plan = order_plan(cached["result"], scan_capital)
         save_order_plan(plan, scan_pool_label, scan_capital)
+        st.session_state["latest_plan"] = plan
         st.caption(f"💾 已自动存档至 output/orders/orders_history.csv")
         render_order_plan(plan, scan_capital)
 
@@ -812,6 +982,18 @@ if run_btn:
 if broker_btn:
     st.subheader(f"📝 券商条件单清单 · {broker}")
     render_condition_orders(read_state(), broker)
+
+elif timing_btn:
+    render_timing_analysis(timing_stop, timing_target, timing_days,
+                           timing_filter, scan_pool_label, pool_code)
+
+elif realtime_btn:
+    cached_plan = st.session_state.get("latest_plan")
+    if cached_plan is None:
+        st.info("请先点「📋 生成今日操作单」，或我现在帮你跑一次：")
+        if st.button("立即扫描并生成操作单"):
+            st.stop()
+    render_realtime_snapshot(cached_plan, scan_pool_label)
 
 elif order_btn or paper_btn or review_btn:
     pass  # 操作单 / 模拟账户 / 持仓体检已在上面渲染，这里不重复展示
